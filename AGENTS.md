@@ -88,6 +88,7 @@ See [00_development.md](docs/operations/00_development.md) for setup, ports, see
 
 ## Pull requests
 
+- **Fork policy (`penouc/tix`):** Never push to or open pull requests against `upstream` (`pingdotgg/t3code`). This fork does not contribute code back to the upstream repository. Always push only to `origin` (`penouc/tix`), and push to a new branch for PR review rather than pushing directly to `origin/main` unless explicitly asked.
 - Never make a PR unless the developer explicitly asks you to do so.
 - `origin` is not always GitHub. Check `git remote get-url origin` before your first forge command and use that forge's CLI and skill. See [Forge mirror](docs/operations/00_development.md#forge-mirror-optional).
 - Conventional commit titles, plain language: `fix(web): new threads no longer spike CPU`.
