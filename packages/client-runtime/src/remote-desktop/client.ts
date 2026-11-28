@@ -1,6 +1,7 @@
 // @effect-diagnostics globalTimers:off globalDate:off -- Browser and WebView remote desktop client runs outside an Effect runtime.
 
 import type {
+  RemoteDesktopCodec,
   RemoteDesktopDisplay,
   RemoteDesktopInputEvent,
   RemoteDesktopQualityPreset,
@@ -33,13 +34,15 @@ export interface RemoteDesktopSessionInfo {
   readonly allowControl: boolean;
   readonly quality: RemoteDesktopQualityPreset;
   readonly maxFps: number;
-  readonly codec: "h264" | "jpeg";
+  readonly codec: RemoteDesktopCodec;
   readonly fingerprint: string;
 }
 
 export interface RemoteDesktopClientStats {
   readonly fps: number;
   readonly rttMs: number | null;
+  readonly bitrateKbps: number;
+  readonly codec: RemoteDesktopCodec;
   readonly transport: RemoteDesktopTransportKind;
   readonly encrypted: boolean;
   readonly width: number;
@@ -85,6 +88,24 @@ function randomPeerId(): string {
   return `v_${hex}`;
 }
 
+async function probeWebCodecsH264Support(): Promise<boolean> {
+  if (
+    typeof globalThis.VideoDecoder !== "function" ||
+    typeof globalThis.EncodedVideoChunk !== "function"
+  ) {
+    return false;
+  }
+  try {
+    const check = await globalThis.VideoDecoder.isConfigSupported({
+      codec: "avc1.4d4028",
+      optimizeForLatency: true,
+    });
+    return check.supported === true;
+  } catch {
+    return false;
+  }
+}
+
 export function buildDirectRemoteDesktopWsUrl(
   httpOrWsOrigin: string,
   directWsPath: string,
@@ -114,6 +135,7 @@ export function createRemoteDesktopClient(
   let socket: WebSocket | null = null;
   let session: RemoteDesktopCryptoSession | null = null;
   let activeTransport: RemoteDesktopTransportKind = "direct";
+  let activeCodec: RemoteDesktopCodec = "h264";
   let preference: "auto" | "direct" | "relay" = config.transportPreference ?? "auto";
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -123,9 +145,32 @@ export function createRemoteDesktopClient(
   let decodingFrame = false;
   let pendingJpeg: Uint8Array | null = null;
   let framesInWindow = 0;
+  let bytesInWindow = 0;
   let latestRttMs: number | null = null;
   let frameWidth = 1920;
   let frameHeight = 1080;
+
+  let videoDecoder: VideoDecoder | null = null;
+  let configuredH264Codec: string | null = null;
+  let awaitingH264Keyframe = true;
+  let h264FallbackSent = false;
+
+  const isStopped = () => stopped;
+
+  const closeVideoDecoder = () => {
+    if (videoDecoder) {
+      try {
+        if (videoDecoder.state !== "closed") {
+          videoDecoder.close();
+        }
+      } catch {
+        // Ignore close errors on already-closed decoder.
+      }
+      videoDecoder = null;
+    }
+    configuredH264Codec = null;
+    awaitingH264Keyframe = true;
+  };
 
   const clearTimers = () => {
     if (reconnectTimer) {
@@ -142,7 +187,136 @@ export function createRemoteDesktopClient(
     }
   };
 
-  const isStopped = () => stopped;
+  const sendEncrypted = (
+    frameType:
+      | typeof REMOTE_DESKTOP_FRAME_TYPE.inputJson
+      | typeof REMOTE_DESKTOP_FRAME_TYPE.controlJson
+      | typeof REMOTE_DESKTOP_FRAME_TYPE.heartbeat,
+    payload: unknown,
+  ) => {
+    const activeSession = session;
+    const activeSocket = socket;
+    if (!activeSession || !activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
+    void activeSession
+      .encryptJson(frameType, payload)
+      .then((encrypted) => {
+        if (socket === activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+          activeSocket.send(
+            encrypted.buffer.slice(
+              encrypted.byteOffset,
+              encrypted.byteOffset + encrypted.byteLength,
+            ) as ArrayBuffer,
+          );
+        }
+      })
+      .catch(() => {
+        // Ignore send errors while reconnecting.
+      });
+  };
+
+  const fallbackToJpeg = () => {
+    closeVideoDecoder();
+    if (!h264FallbackSent) {
+      h264FallbackSent = true;
+      sendEncrypted(REMOTE_DESKTOP_FRAME_TYPE.controlJson, {
+        type: "client_hello",
+        supportsH264: false,
+      });
+    }
+  };
+
+  const decodeH264AccessUnit = (payload: Uint8Array) => {
+    if (isStopped() || !ctx || payload.byteLength <= 15) return;
+    const flags = payload[0]!;
+    const isKeyframe = (flags & 1) === 1;
+    const view = new DataView(payload.buffer, payload.byteOffset, 15);
+    const timestampUs = Number(view.getBigUint64(5, false));
+    const codecLen = view.getUint16(13, false);
+    if (payload.byteLength <= 15 + codecLen) return;
+
+    const codecString =
+      codecLen > 0
+        ? textDecoder.decode(payload.subarray(15, 15 + codecLen))
+        : (configuredH264Codec ?? "avc1.4d4028");
+    const annexB = payload.subarray(15 + codecLen);
+
+    if (awaitingH264Keyframe && !isKeyframe) {
+      return;
+    }
+
+    if (
+      !videoDecoder ||
+      videoDecoder.state === "closed" ||
+      (isKeyframe && configuredH264Codec !== codecString)
+    ) {
+      closeVideoDecoder();
+      if (typeof globalThis.VideoDecoder !== "function") {
+        fallbackToJpeg();
+        return;
+      }
+      try {
+        const decoder = new globalThis.VideoDecoder({
+          output: (videoFrame) => {
+            try {
+              if (!isStopped() && ctx) {
+                const w = videoFrame.displayWidth || videoFrame.codedWidth;
+                const h = videoFrame.displayHeight || videoFrame.codedHeight;
+                if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+                  canvas.width = w;
+                  canvas.height = h;
+                  frameWidth = w;
+                  frameHeight = h;
+                }
+                ctx.drawImage(videoFrame, 0, 0);
+                framesInWindow += 1;
+              }
+            } finally {
+              videoFrame.close();
+            }
+          },
+          error: () => {
+            fallbackToJpeg();
+          },
+        });
+        decoder.configure({
+          codec: codecString,
+          optimizeForLatency: true,
+          hardwareAcceleration: "prefer-hardware",
+        });
+        videoDecoder = decoder;
+        configuredH264Codec = codecString;
+      } catch {
+        fallbackToJpeg();
+        return;
+      }
+    }
+
+    if (videoDecoder.decodeQueueSize > 3 && !isKeyframe) {
+      // Drop delta frame if hardware decoder falls behind, then request a clean IDR keyframe.
+      awaitingH264Keyframe = true;
+      sendEncrypted(REMOTE_DESKTOP_FRAME_TYPE.controlJson, { type: "request_keyframe" });
+      return;
+    }
+
+    try {
+      const copy = new Uint8Array(annexB.byteLength);
+      copy.set(annexB);
+      videoDecoder.decode(
+        new globalThis.EncodedVideoChunk({
+          type: isKeyframe ? "key" : "delta",
+          timestamp: Number.isFinite(timestampUs) ? timestampUs : performance.now() * 1000,
+          data: copy,
+        }),
+      );
+      if (isKeyframe) {
+        awaitingH264Keyframe = false;
+      }
+      activeCodec = "h264";
+    } catch {
+      awaitingH264Keyframe = true;
+      fallbackToJpeg();
+    }
+  };
 
   const renderJpegFrame = async (jpegBytes: Uint8Array) => {
     if (isStopped() || !ctx) return;
@@ -151,6 +325,7 @@ export function createRemoteDesktopClient(
       return;
     }
     decodingFrame = true;
+    activeCodec = "jpeg";
     try {
       let next: Uint8Array | null = jpegBytes;
       while (next && !isStopped()) {
@@ -203,33 +378,6 @@ export function createRemoteDesktopClient(
     }
   };
 
-  const sendEncrypted = (
-    frameType:
-      | typeof REMOTE_DESKTOP_FRAME_TYPE.inputJson
-      | typeof REMOTE_DESKTOP_FRAME_TYPE.controlJson
-      | typeof REMOTE_DESKTOP_FRAME_TYPE.heartbeat,
-    payload: unknown,
-  ) => {
-    const activeSession = session;
-    const activeSocket = socket;
-    if (!activeSession || !activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
-    void activeSession
-      .encryptJson(frameType, payload)
-      .then((encrypted) => {
-        if (socket === activeSocket && activeSocket.readyState === WebSocket.OPEN) {
-          activeSocket.send(
-            encrypted.buffer.slice(
-              encrypted.byteOffset,
-              encrypted.byteOffset + encrypted.byteLength,
-            ) as ArrayBuffer,
-          );
-        }
-      })
-      .catch(() => {
-        // Ignore send errors while reconnecting.
-      });
-  };
-
   const chooseEndpoint = (): {
     readonly transport: RemoteDesktopTransportKind;
     readonly url: string;
@@ -279,7 +427,9 @@ export function createRemoteDesktopClient(
   const connect = () => {
     if (stopped) return;
     clearTimers();
+    closeVideoDecoder();
     session = null;
+    h264FallbackSent = false;
     if (socket) {
       try {
         socket.close(1000, "Reconnecting");
@@ -327,6 +477,7 @@ export function createRemoteDesktopClient(
     const scheduleReconnect = (detail: string) => {
       if (stopped || socket !== ws) return;
       clearTimers();
+      closeVideoDecoder();
       socket = null;
       session = null;
       if (endpoint.transport === "direct" && config.relayUrl && preference === "auto") {
@@ -376,9 +527,11 @@ export function createRemoteDesktopClient(
           } else if (msg.type === "host_status") {
             if (msg.online) {
               session = null;
+              closeVideoDecoder();
               sendHandshake();
             } else {
               session = null;
+              closeVideoDecoder();
               callbacks.onStatus("waiting_host", "Host disconnected from relay. Waiting...");
             }
           } else if (msg.type === "error" && msg.message) {
@@ -398,6 +551,8 @@ export function createRemoteDesktopClient(
             : null;
       if (!raw) return;
 
+      bytesInWindow += raw.byteLength;
+
       if (!session) {
         if (!handshakeSent || !isHandshakeFrame(raw)) return;
         void RemoteDesktopCryptoSession.establish({
@@ -405,9 +560,16 @@ export function createRemoteDesktopClient(
           peerHandshakeFrame: raw,
           masterKey: config.masterKey,
         })
-          .then((established) => {
+          .then(async (established) => {
             if (stopped || socket !== ws) return;
             session = established;
+            const supportsH264 = await probeWebCodecsH264Support();
+            if (stopped || socket !== ws) return;
+            activeCodec = supportsH264 ? "h264" : "jpeg";
+            sendEncrypted(REMOTE_DESKTOP_FRAME_TYPE.controlJson, {
+              type: "client_hello",
+              supportsH264,
+            });
             callbacks.onStatus("streaming");
             heartbeatTimer = setInterval(() => {
               if (ws.readyState === WebSocket.OPEN) {
@@ -428,12 +590,15 @@ export function createRemoteDesktopClient(
               callbacks.onStats({
                 fps: framesInWindow,
                 rttMs: latestRttMs,
+                bitrateKbps: Math.round((bytesInWindow * 8) / 1000),
+                codec: activeCodec,
                 transport: activeTransport,
                 encrypted: true,
                 width: frameWidth,
                 height: frameHeight,
               });
               framesInWindow = 0;
+              bytesInWindow = 0;
             }, 1000);
           })
           .catch((err) => {
@@ -450,6 +615,10 @@ export function createRemoteDesktopClient(
         .decryptFrame(raw)
         .then((decoded) => {
           if (stopped || socket !== ws) return;
+          if (decoded.frameType === REMOTE_DESKTOP_FRAME_TYPE.videoH264) {
+            decodeH264AccessUnit(decoded.payload);
+            return;
+          }
           if (decoded.frameType === REMOTE_DESKTOP_FRAME_TYPE.videoJpeg) {
             if (decoded.payload.byteLength <= 12) return;
             const jpegBytes = decoded.payload.subarray(12);
@@ -476,11 +645,12 @@ export function createRemoteDesktopClient(
               readonly allowControl?: boolean;
               readonly quality?: RemoteDesktopQualityPreset;
               readonly maxFps?: number;
-              readonly codec?: "h264" | "jpeg";
+              readonly codec?: RemoteDesktopCodec;
               readonly fingerprint?: string;
               readonly message?: string;
             };
             if (parsed.type === "session_info") {
+              if (parsed.codec) activeCodec = parsed.codec;
               callbacks.onSessionInfo({
                 displays: parsed.displays ?? [],
                 activeDisplayId: parsed.activeDisplayId ?? "display-0",
@@ -489,7 +659,7 @@ export function createRemoteDesktopClient(
                 allowControl: Boolean(parsed.allowControl),
                 quality: parsed.quality ?? "hd",
                 maxFps: parsed.maxFps ?? 30,
-                codec: parsed.codec ?? "jpeg",
+                codec: parsed.codec ?? activeCodec,
                 fingerprint: parsed.fingerprint ?? identity.fingerprint,
               });
             } else if (parsed.type === "capture_error" && parsed.message) {
@@ -537,6 +707,7 @@ export function createRemoteDesktopClient(
     stop: () => {
       stopped = true;
       clearTimers();
+      closeVideoDecoder();
       session = null;
       if (socket) {
         try {

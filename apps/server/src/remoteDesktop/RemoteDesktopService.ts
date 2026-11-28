@@ -43,8 +43,10 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { InputInjectionDriver, detectInputBackend } from "./InputInjectionDriver.ts";
 import {
+  type CapturedFrame,
   type CaptureSessionHandle,
   detectCaptureBackend,
+  detectH264Encoder,
   listHostDisplays,
   startScreenCapture,
 } from "./ScreenCaptureDriver.ts";
@@ -52,6 +54,7 @@ import {
 const MASTER_KEY_SECRET_NAME = "remote-desktop-master-key";
 const DIRECT_TICKET_TTL_MS = 120_000;
 const RELAY_PING_INTERVAL_MS = 25_000;
+const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 const decodeInputEvent = Schema.decodeUnknownOption(RemoteDesktopInputEvent);
 
@@ -70,6 +73,8 @@ interface ActiveViewer {
   readonly disconnect: (reason?: string) => void;
   cryptoSession: RemoteDesktopCryptoSession | null;
   sendingFrame: boolean;
+  supportsH264: boolean;
+  awaitingKeyframe: boolean;
 }
 
 interface DirectTicketRecord {
@@ -141,6 +146,7 @@ const make = Effect.gen(function* () {
 
   const statusPubSub = yield* PubSub.sliding<RemoteDesktopStatus>(16);
   const captureBackend = detectCaptureBackend(platform);
+  const hasH264Encoder = captureBackend === "ffmpeg-h264" && detectH264Encoder(platform) !== null;
   const inputBackend = detectInputBackend(platform);
   const inputDriver = new InputInjectionDriver(config.stateDir, platform);
 
@@ -253,8 +259,16 @@ const make = Effect.gen(function* () {
       });
   };
 
+  const resolvedCaptureCodec = (): "h264" | "jpeg" => {
+    if (!hasH264Encoder) return "jpeg";
+    const authenticated = Array.from(viewers.values()).filter((v) => v.cryptoSession !== null);
+    if (authenticated.length === 0) return "h264";
+    return authenticated.every((v) => v.supportsH264) ? "h264" : "jpeg";
+  };
+
   const broadcastControlState = () => {
     const display = activeDisplay();
+    const activeCodec = captureHandle?.codec ?? resolvedCaptureCodec();
     for (const viewer of viewers.values()) {
       if (!viewer.cryptoSession) continue;
       sendEncryptedJsonToViewer(viewer, REMOTE_DESKTOP_FRAME_TYPE.controlJson, {
@@ -266,29 +280,64 @@ const make = Effect.gen(function* () {
         allowControl: viewer.controlAllowed && currentSettings.allowControl,
         quality: currentQuality,
         maxFps: currentMaxFps,
-        codec: "jpeg",
+        codec: activeCodec,
         fingerprint: relayIdentity.fingerprint,
       });
     }
   };
 
-  const broadcastFrame = (jpegBytes: Uint8Array) => {
+  const broadcastFrame = (frame: CapturedFrame) => {
     frameCounter += 1;
     const seqNum = frameCounter;
-    const now = Date.now();
-    // Prefix 12-byte metadata header inside the encrypted payload: [4B frameSeq][8B timestampMs]
-    const payload = new Uint8Array(12 + jpegBytes.byteLength);
-    const view = new DataView(payload.buffer);
-    view.setUint32(0, seqNum >>> 0, false);
-    view.setBigUint64(4, BigInt(now), false);
-    payload.set(jpegBytes, 12);
+
+    let frameType:
+      | typeof REMOTE_DESKTOP_FRAME_TYPE.videoH264
+      | typeof REMOTE_DESKTOP_FRAME_TYPE.videoJpeg;
+    let payload: Uint8Array;
+
+    if (frame.codec === "h264") {
+      frameType = REMOTE_DESKTOP_FRAME_TYPE.videoH264;
+      const codecBytes = frame.isKeyframe
+        ? textEncoder.encode(frame.codecString)
+        : new Uint8Array(0);
+      payload = new Uint8Array(15 + codecBytes.byteLength + frame.bytes.byteLength);
+      const view = new DataView(payload.buffer);
+      payload[0] = frame.isKeyframe ? 1 : 0;
+      view.setUint32(1, seqNum >>> 0, false);
+      view.setBigUint64(5, BigInt(Date.now()) * 1000n, false);
+      view.setUint16(13, codecBytes.byteLength, false);
+      payload.set(codecBytes, 15);
+      payload.set(frame.bytes, 15 + codecBytes.byteLength);
+    } else {
+      frameType = REMOTE_DESKTOP_FRAME_TYPE.videoJpeg;
+      payload = new Uint8Array(12 + frame.bytes.byteLength);
+      const view = new DataView(payload.buffer);
+      view.setUint32(0, seqNum >>> 0, false);
+      view.setBigUint64(4, BigInt(Date.now()), false);
+      payload.set(frame.bytes, 12);
+    }
 
     for (const viewer of viewers.values()) {
       const session = viewer.cryptoSession;
-      if (!session || viewer.sendingFrame) continue;
+      if (!session) continue;
+
+      if (frame.codec === "h264") {
+        if (viewer.awaitingKeyframe && !frame.isKeyframe) continue;
+        if (viewer.sendingFrame) {
+          // Dropping an H.264 delta/key frame breaks GOP dependencies: wait cleanly for next IDR.
+          viewer.awaitingKeyframe = true;
+          continue;
+        }
+        if (frame.isKeyframe) {
+          viewer.awaitingKeyframe = false;
+        }
+      } else if (viewer.sendingFrame) {
+        continue;
+      }
+
       viewer.sendingFrame = true;
       void session
-        .encryptFrame(REMOTE_DESKTOP_FRAME_TYPE.videoJpeg, payload)
+        .encryptFrame(frameType, payload)
         .then((encrypted) => {
           if (viewers.get(viewer.peerId) === viewer) {
             viewer.sendRaw(encrypted);
@@ -315,6 +364,10 @@ const make = Effect.gen(function* () {
     if (authenticatedCount === 0 || !currentSettings.enabled) return;
     if (captureStartInFlight) return;
     captureStartInFlight = true;
+    const preferredCodec = resolvedCaptureCodec();
+    for (const viewer of viewers.values()) {
+      viewer.awaitingKeyframe = true;
+    }
     try {
       const handle = await startScreenCapture(
         platform,
@@ -322,9 +375,10 @@ const make = Effect.gen(function* () {
           display: activeDisplay(),
           quality: currentQuality,
           maxFps: currentMaxFps,
+          preferredCodec,
         },
         {
-          onFrame: (jpegBytes) => broadcastFrame(jpegBytes),
+          onFrame: (frame) => broadcastFrame(frame),
           onError: (message) => {
             for (const viewer of viewers.values()) {
               sendEncryptedJsonToViewer(viewer, REMOTE_DESKTOP_FRAME_TYPE.controlJson, {
@@ -339,6 +393,7 @@ const make = Effect.gen(function* () {
         handle.stop();
       } else {
         captureHandle = handle;
+        broadcastControlState();
       }
     } finally {
       captureStartInFlight = false;
@@ -346,7 +401,11 @@ const make = Effect.gen(function* () {
   };
 
   const ensureCaptureRunning = () => {
-    if (!captureHandle && !captureStartInFlight && currentSettings.enabled) {
+    if (!currentSettings.enabled) return;
+    if (!captureHandle && !captureStartInFlight) {
+      void restartCapture();
+    } else if (captureHandle?.codec === "h264" && !captureStartInFlight) {
+      // Restarting H.264 on new viewer join guarantees an immediate IDR keyframe.
       void restartCapture();
     }
   };
@@ -413,7 +472,18 @@ const make = Effect.gen(function* () {
         decoded.frameType === REMOTE_DESKTOP_FRAME_TYPE.inputJson ||
         decoded.frameType === REMOTE_DESKTOP_FRAME_TYPE.controlJson
       ) {
-        const json = JSON.parse(textDecoder.decode(decoded.payload)) as unknown;
+        const json = JSON.parse(textDecoder.decode(decoded.payload)) as Record<string, unknown>;
+        if (json.type === "client_hello") {
+          const nextSupportsH264 = json.supportsH264 === true;
+          if (viewer.supportsH264 !== nextSupportsH264) {
+            viewer.supportsH264 = nextSupportsH264;
+            const desiredCodec = resolvedCaptureCodec();
+            if (captureHandle && captureHandle.codec !== desiredCodec) {
+              void restartCapture();
+            }
+          }
+          return;
+        }
         const parsed = decodeInputEvent(json);
         if (Option.isNone(parsed)) return;
         const event = parsed.value;
@@ -436,6 +506,10 @@ const make = Effect.gen(function* () {
           return;
         }
         if (event.type === "request_keyframe") {
+          viewer.awaitingKeyframe = true;
+          if (captureHandle?.codec === "h264") {
+            void restartCapture();
+          }
           return;
         }
         if (currentSettings.allowControl && viewer.controlAllowed) {
@@ -611,6 +685,8 @@ const make = Effect.gen(function* () {
           },
           cryptoSession: null,
           sendingFrame: false,
+          supportsH264: hasH264Encoder,
+          awaitingKeyframe: true,
         };
         viewers.set(routed.peerId, viewer);
       }
@@ -762,7 +838,7 @@ const make = Effect.gen(function* () {
       allowControl,
       displays: [...displays],
       activeDisplayId,
-      preferredCodec: "jpeg" as const,
+      preferredCodec: hasH264Encoder ? ("h264" as const) : ("jpeg" as const),
     } satisfies RemoteDesktopConnectTicket;
   });
 
@@ -908,6 +984,8 @@ const make = Effect.gen(function* () {
       disconnect: (reason) => params.socket.close(1000, reason ?? "Disconnected"),
       cryptoSession: null,
       sendingFrame: false,
+      supportsH264: hasH264Encoder,
+      awaitingKeyframe: true,
     };
     const previous = viewers.get(params.peerId);
     if (previous) {

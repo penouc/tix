@@ -65,6 +65,8 @@ export function RemoteDesktopRouteScreen({ route }: RemoteDesktopRouteScreenProp
   const [stats, setStats] = useState<RemoteDesktopClientStats>({
     fps: 0,
     rttMs: null,
+    bitrateKbps: 0,
+    codec: "h264",
     transport: route.params.directOrigin && route.params.directTicket ? "direct" : "relay",
     encrypted: false,
     width: 1920,
@@ -104,9 +106,14 @@ export function RemoteDesktopRouteScreen({ route }: RemoteDesktopRouteScreenProp
   const e2eeBadgeText = fingerprint && !collapsed ? `E2EE · ${fingerprint.slice(0, 9)}` : "E2EE";
   const activeQuality = sessionInfo?.quality ?? "hd";
   const transportLabel = stats.transport === "relay" ? gt("Relay") : gt("Direct");
+  const codecLabel = stats.codec === "h264" ? "H.264" : "JPEG";
+  const bitrateLabel =
+    stats.bitrateKbps >= 1000
+      ? `${(stats.bitrateKbps / 1000).toFixed(1)}M`
+      : `${stats.bitrateKbps}k`;
   const hudStatsText =
     status === "streaming"
-      ? `${transportLabel} · ${stats.fps}fps${stats.rttMs !== null ? ` · ${stats.rttMs}ms` : ""}`
+      ? `${transportLabel} · ${codecLabel} · ${stats.fps}fps · ${bitrateLabel}${stats.rttMs !== null ? ` · ${stats.rttMs}ms` : ""}`
       : transportLabel;
 
   const toggleViewOnly = () => {

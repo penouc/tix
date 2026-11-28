@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off -- OS input injection runs in an isolated child process boundary.
+// @effect-diagnostics nodeBuiltinImport:off -- OS input injection runs in an isolated persistent child process boundary.
 
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -152,11 +152,76 @@ while let line = readLine() {
 }
 `;
 
+/**
+ * Persistent PowerShell stdin loop for Windows (< 2ms input latency, zero per-event spawn).
+ */
+const WIN32_PERSISTENT_INPUT_SCRIPT = [
+  "Add-Type -TypeDefinition @'",
+  "using System;",
+  "using System.Runtime.InteropServices;",
+  "public static class TixWinInput {",
+  '  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);',
+  '  [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);',
+  '  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);',
+  "  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }",
+  "  [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public KEYBDINPUT ki; }",
+  "  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION u; }",
+  '  [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);',
+  "  public static void SendUnicode(string text) {",
+  "    foreach (char ch in text) {",
+  "      INPUT[] inputs = new INPUT[2];",
+  "      inputs[0].type = 1; inputs[0].u.ki.wScan = (ushort)ch; inputs[0].u.ki.dwFlags = 0x0004;",
+  "      inputs[1].type = 1; inputs[1].u.ki.wScan = (ushort)ch; inputs[1].u.ki.dwFlags = 0x0004 | 0x0002;",
+  "      SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));",
+  "    }",
+  "  }",
+  "}",
+  "'@",
+  "$vkMap = @{ backspace=0x08; tab=0x09; enter=0x0D; return=0x0D; shift=0x10; ctrl=0x11; control=0x11; alt=0x12; escape=0x1B; esc=0x1B; space=0x20; ' '=0x20; pageup=0x21; pagedown=0x22; end=0x23; home=0x24; arrowleft=0x25; left=0x25; arrowup=0x26; up=0x26; arrowright=0x27; right=0x27; arrowdown=0x28; down=0x28; delete=0x2E; meta=0x5B; cmd=0x5B }",
+  "while ($null -ne ($line = [Console]::In.ReadLine())) {",
+  "  if (-not $line) { continue }",
+  "  try { $cmd = $line | ConvertFrom-Json } catch { continue }",
+  "  switch ($cmd.type) {",
+  "    'mouse_move' { [TixWinInput]::SetCursorPos([int]$cmd.px, [int]$cmd.py) | Out-Null }",
+  "    'mouse_button' {",
+  "      [TixWinInput]::SetCursorPos([int]$cmd.px, [int]$cmd.py) | Out-Null",
+  "      $down = if ($cmd.button -eq 'right') { 0x0008 } elseif ($cmd.button -eq 'middle') { 0x0020 } else { 0x0002 }",
+  "      $up = if ($cmd.button -eq 'right') { 0x0010 } elseif ($cmd.button -eq 'middle') { 0x0040 } else { 0x0004 }",
+  "      if ($cmd.action -eq 'down') { [TixWinInput]::mouse_event($down,0,0,0,[UIntPtr]::Zero) }",
+  "      elseif ($cmd.action -eq 'up') { [TixWinInput]::mouse_event($up,0,0,0,[UIntPtr]::Zero) }",
+  "      elseif ($cmd.action -eq 'double_click') { [TixWinInput]::mouse_event($down,0,0,0,[UIntPtr]::Zero); [TixWinInput]::mouse_event($up,0,0,0,[UIntPtr]::Zero); [TixWinInput]::mouse_event($down,0,0,0,[UIntPtr]::Zero); [TixWinInput]::mouse_event($up,0,0,0,[UIntPtr]::Zero) }",
+  "      else { [TixWinInput]::mouse_event($down,0,0,0,[UIntPtr]::Zero); [TixWinInput]::mouse_event($up,0,0,0,[UIntPtr]::Zero) }",
+  "    }",
+  "    'mouse_scroll' {",
+  "      $dy = [int](-$cmd.deltaY)",
+  "      if ($dy -ne 0) { [TixWinInput]::mouse_event(0x0800, 0, 0, $dy, [UIntPtr]::Zero) }",
+  "    }",
+  "    'key' {",
+  "      $k = ([string]$cmd.key).ToLower()",
+  "      $vk = if ($vkMap.ContainsKey($k)) { [byte]$vkMap[$k] } elseif ($k.Length -eq 1) { [byte][char]$k.ToUpper() } else { 0 }",
+  "      if ($vk -ne 0) {",
+  "        $mods = @()",
+  "        foreach ($m in ($cmd.modifiers | ForEach-Object { ([string]$_).ToLower() })) {",
+  "          if ($vkMap.ContainsKey($m)) { $mods += [byte]$vkMap[$m] }",
+  "        }",
+  "        foreach ($mv in $mods) { [TixWinInput]::keybd_event($mv, 0, 0, [UIntPtr]::Zero) }",
+  "        [TixWinInput]::keybd_event($vk, 0, 0, [UIntPtr]::Zero)",
+  "        [TixWinInput]::keybd_event($vk, 0, 2, [UIntPtr]::Zero)",
+  "        for ($i = $mods.Count - 1; $i -ge 0; $i--) { [TixWinInput]::keybd_event($mods[$i], 0, 2, [UIntPtr]::Zero) }",
+  "      }",
+  "    }",
+  "    'text' { if ($cmd.text) { [TixWinInput]::SendUnicode([string]$cmd.text) } }",
+  "  }",
+  "}",
+].join("\n");
+
 export class InputInjectionDriver {
   private readonly stateDir: string;
   private readonly platform: NodeJS.Platform;
   private macHelperProcess: NodeChildProcess.ChildProcessWithoutNullStreams | null = null;
   private macHelperReadyPromise: Promise<string | null> | null = null;
+  private winHelperProcess: NodeChildProcess.ChildProcessWithoutNullStreams | null = null;
+  private linuxXdotoolProcess: NodeChildProcess.ChildProcessWithoutNullStreams | null = null;
 
   constructor(stateDir: string, platform: NodeJS.Platform) {
     this.stateDir = stateDir;
@@ -208,6 +273,49 @@ export class InputInjectionDriver {
     return child;
   }
 
+  private ensureWinHelperProcess(): NodeChildProcess.ChildProcessWithoutNullStreams {
+    if (
+      this.winHelperProcess &&
+      !this.winHelperProcess.killed &&
+      this.winHelperProcess.exitCode === null
+    ) {
+      return this.winHelperProcess;
+    }
+    const child = NodeChildProcess.spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command", WIN32_PERSISTENT_INPUT_SCRIPT],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    child.on("exit", () => {
+      if (this.winHelperProcess === child) {
+        this.winHelperProcess = null;
+      }
+    });
+    this.winHelperProcess = child;
+    return child;
+  }
+
+  private ensureLinuxXdotoolProcess(): NodeChildProcess.ChildProcessWithoutNullStreams | null {
+    if (!commandExistsSync(this.platform, "xdotool")) return null;
+    if (
+      this.linuxXdotoolProcess &&
+      !this.linuxXdotoolProcess.killed &&
+      this.linuxXdotoolProcess.exitCode === null
+    ) {
+      return this.linuxXdotoolProcess;
+    }
+    const child = NodeChildProcess.spawn("xdotool", ["-"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.on("exit", () => {
+      if (this.linuxXdotoolProcess === child) {
+        this.linuxXdotoolProcess = null;
+      }
+    });
+    this.linuxXdotoolProcess = child;
+    return child;
+  }
+
   async dispatch(event: RemoteDesktopInputEvent, display: RemoteDesktopDisplay): Promise<void> {
     if (
       event.type === "set_display" ||
@@ -222,105 +330,83 @@ export class InputInjectionDriver {
       py: Math.round(Math.max(0, Math.min(1, ny)) * Math.max(1, display.height - 1)),
     });
 
+    const buildJsonPayload = (): Record<string, unknown> => {
+      if (event.type === "mouse_move") {
+        return { type: "mouse_move", ...toPx(event.x, event.y) };
+      }
+      if (event.type === "mouse_button") {
+        return {
+          type: "mouse_button",
+          button: event.button,
+          action: event.action,
+          ...toPx(event.x, event.y),
+        };
+      }
+      if (event.type === "mouse_scroll") {
+        return { type: "mouse_scroll", deltaX: event.deltaX, deltaY: event.deltaY };
+      }
+      if (event.type === "key") {
+        return {
+          type: "key",
+          action: event.action,
+          key: event.key,
+          modifiers: event.modifiers ?? [],
+        };
+      }
+      return { type: "text", text: event.text };
+    };
+
     if (this.platform === "darwin") {
       const helper = await this.ensureMacHelperProcess();
       if (helper) {
-        let payload: Record<string, unknown>;
-        if (event.type === "mouse_move") {
-          payload = { type: "mouse_move", ...toPx(event.x, event.y) };
-        } else if (event.type === "mouse_button") {
-          payload = {
-            type: "mouse_button",
-            button: event.button,
-            action: event.action,
-            ...toPx(event.x, event.y),
-          };
-        } else if (event.type === "mouse_scroll") {
-          payload = { type: "mouse_scroll", deltaX: event.deltaX, deltaY: event.deltaY };
-        } else if (event.type === "key") {
-          payload = {
-            type: "key",
-            action: event.action,
-            key: event.key,
-            modifiers: event.modifiers ?? [],
-          };
-        } else {
-          payload = { type: "text", text: event.text };
-        }
-        helper.stdin.write(`${JSON.stringify(payload)}\n`);
-      }
-      return;
-    }
-
-    if (this.platform === "linux" && commandExistsSync(this.platform, "xdotool")) {
-      const run = (args: ReadonlyArray<string>) =>
-        new Promise<void>((resolve) => {
-          NodeChildProcess.execFile("xdotool", [...args], { timeout: 2000 }, () => resolve());
-        });
-
-      if (event.type === "mouse_move") {
-        const { px, py } = toPx(event.x, event.y);
-        await run(["mousemove", "--sync", String(px), String(py)]);
-      } else if (event.type === "mouse_button") {
-        const { px, py } = toPx(event.x, event.y);
-        const btn = event.button === "right" ? "3" : event.button === "middle" ? "2" : "1";
-        await run(["mousemove", "--sync", String(px), String(py)]);
-        if (event.action === "down") await run(["mousedown", btn]);
-        else if (event.action === "up") await run(["mouseup", btn]);
-        else if (event.action === "double_click") await run(["click", "--repeat", "2", btn]);
-        else await run(["click", btn]);
-      } else if (event.type === "mouse_scroll") {
-        const btn = event.deltaY > 0 ? "5" : "4";
-        const steps = Math.max(1, Math.min(8, Math.round(Math.abs(event.deltaY) / 40)));
-        await run(["click", "--repeat", String(steps), btn]);
-      } else if (event.type === "key") {
-        const combo = [...(event.modifiers ?? []), event.key].join("+");
-        await run([
-          event.action === "down" ? "keydown" : event.action === "up" ? "keyup" : "key",
-          combo,
-        ]);
-      } else if (event.type === "text") {
-        await run(["type", "--clearmodifiers", "--", event.text]);
+        helper.stdin.write(`${JSON.stringify(buildJsonPayload())}\n`);
       }
       return;
     }
 
     if (this.platform === "win32") {
-      if (event.type === "mouse_move" || event.type === "mouse_button") {
+      const helper = this.ensureWinHelperProcess();
+      helper.stdin.write(`${JSON.stringify(buildJsonPayload())}\n`);
+      return;
+    }
+
+    if (this.platform === "linux") {
+      const helper = this.ensureLinuxXdotoolProcess();
+      if (!helper) return;
+      if (event.type === "mouse_move") {
         const { px, py } = toPx(event.x, event.y);
-        const flag =
-          event.type === "mouse_move"
-            ? ""
-            : event.button === "right"
-              ? event.action === "down"
-                ? "[Win32Input]::mouse_event(0x0008,0,0,0,0);"
-                : event.action === "up"
-                  ? "[Win32Input]::mouse_event(0x0010,0,0,0,0);"
-                  : "[Win32Input]::mouse_event(0x0008,0,0,0,0);[Win32Input]::mouse_event(0x0010,0,0,0,0);"
-              : event.action === "down"
-                ? "[Win32Input]::mouse_event(0x0002,0,0,0,0);"
-                : event.action === "up"
-                  ? "[Win32Input]::mouse_event(0x0004,0,0,0,0);"
-                  : "[Win32Input]::mouse_event(0x0002,0,0,0,0);[Win32Input]::mouse_event(0x0004,0,0,0,0);";
-        const ps =
-          'Add-Type -MemberDefinition "[DllImport(\\"user32.dll\\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\\"user32.dll\\")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);" -Name Win32Input -Namespace Native; ' +
-          `[Native.Win32Input]::SetCursorPos(${px}, ${py}) | Out-Null; ${flag.replaceAll("[Win32Input]", "[Native.Win32Input]")}`;
-        await new Promise<void>((resolve) => {
-          NodeChildProcess.execFile(
-            "powershell.exe",
-            ["-NoProfile", "-Command", ps],
-            { timeout: 2000 },
-            () => resolve(),
-          );
-        });
+        helper.stdin.write(`mousemove ${px} ${py}\n`);
+      } else if (event.type === "mouse_button") {
+        const { px, py } = toPx(event.x, event.y);
+        const btn = event.button === "right" ? "3" : event.button === "middle" ? "2" : "1";
+        helper.stdin.write(`mousemove ${px} ${py}\n`);
+        if (event.action === "down") helper.stdin.write(`mousedown ${btn}\n`);
+        else if (event.action === "up") helper.stdin.write(`mouseup ${btn}\n`);
+        else if (event.action === "double_click") helper.stdin.write(`click --repeat 2 ${btn}\n`);
+        else helper.stdin.write(`click ${btn}\n`);
+      } else if (event.type === "mouse_scroll") {
+        const btn = event.deltaY > 0 ? "5" : "4";
+        const steps = Math.max(1, Math.min(8, Math.round(Math.abs(event.deltaY) / 40)));
+        helper.stdin.write(`click --repeat ${steps} ${btn}\n`);
+      } else if (event.type === "key") {
+        const combo = [...(event.modifiers ?? []), event.key].join("+");
+        const verb = event.action === "down" ? "keydown" : event.action === "up" ? "keyup" : "key";
+        helper.stdin.write(`${verb} ${combo}\n`);
+      } else if (event.type === "text") {
+        const escaped = event.text.replaceAll("\n", " ");
+        helper.stdin.write(`type --clearmodifiers -- ${escaped}\n`);
       }
     }
   }
 
   dispose(): void {
-    if (this.macHelperProcess && !this.macHelperProcess.killed) {
-      this.macHelperProcess.kill("SIGTERM");
+    for (const child of [this.macHelperProcess, this.winHelperProcess, this.linuxXdotoolProcess]) {
+      if (child && !child.killed) {
+        child.kill("SIGTERM");
+      }
     }
     this.macHelperProcess = null;
+    this.winHelperProcess = null;
+    this.linuxXdotoolProcess = null;
   }
 }

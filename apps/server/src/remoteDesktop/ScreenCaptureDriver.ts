@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off -- OS screen capture spawns system binaries and streams raw frames from stdout.
+// @effect-diagnostics nodeBuiltinImport:off -- OS screen capture spawns system binaries and streams raw encoded frames from stdout.
 
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -6,32 +6,61 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import type { RemoteDesktopDisplay, RemoteDesktopQualityPreset } from "@t3tools/contracts";
+import type {
+  RemoteDesktopCodec,
+  RemoteDesktopDisplay,
+  RemoteDesktopQualityPreset,
+} from "@t3tools/contracts";
 
 export type CaptureBackendKind = "ffmpeg-h264" | "screencapture-jpeg" | "unavailable";
+export type H264EncoderKind = "h264_videotoolbox" | "h264_nvenc" | "h264_mf" | "libx264";
 
 export interface CaptureOptions {
   readonly display: RemoteDesktopDisplay;
   readonly quality: RemoteDesktopQualityPreset;
   readonly maxFps: number;
+  readonly preferredCodec: RemoteDesktopCodec;
 }
+
+export type CapturedFrame =
+  | {
+      readonly codec: "h264";
+      readonly isKeyframe: boolean;
+      readonly codecString: string;
+      readonly bytes: Uint8Array;
+    }
+  | {
+      readonly codec: "jpeg";
+      readonly isKeyframe: true;
+      readonly bytes: Uint8Array;
+    };
 
 export interface CaptureSessionHandle {
   readonly backend: CaptureBackendKind;
+  readonly codec: RemoteDesktopCodec;
   readonly stop: () => void;
 }
 
 const QUALITY_PROFILES: Record<
   RemoteDesktopQualityPreset,
-  { readonly maxWidth: number; readonly qscale: number; readonly defaultFps: number }
+  {
+    readonly maxWidth: number;
+    readonly qscale: number;
+    readonly defaultFps: number;
+    readonly bitrateKbps: number;
+    readonly maxBitrateKbps: number;
+  }
 > = {
-  smooth: { maxWidth: 1024, qscale: 10, defaultFps: 18 },
-  auto: { maxWidth: 1440, qscale: 7, defaultFps: 24 },
-  hd: { maxWidth: 1920, qscale: 5, defaultFps: 30 },
-  ultra: { maxWidth: 2560, qscale: 3, defaultFps: 45 },
+  smooth: { maxWidth: 1280, qscale: 10, defaultFps: 30, bitrateKbps: 1200, maxBitrateKbps: 1800 },
+  auto: { maxWidth: 1600, qscale: 7, defaultFps: 30, bitrateKbps: 2200, maxBitrateKbps: 3200 },
+  hd: { maxWidth: 1920, qscale: 5, defaultFps: 45, bitrateKbps: 3500, maxBitrateKbps: 5000 },
+  ultra: { maxWidth: 2560, qscale: 3, defaultFps: 60, bitrateKbps: 6000, maxBitrateKbps: 8500 },
 };
 
 const MAC_SCREENCAPTURE_PATH = "/usr/sbin/screencapture";
+const START_CODE_4 = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
+
+let cachedH264Encoder: H264EncoderKind | null | undefined;
 
 function commandExistsSync(platform: NodeJS.Platform, command: string): boolean {
   const probe = platform === "win32" ? "where" : "which";
@@ -50,6 +79,29 @@ export function detectCaptureBackend(platform: NodeJS.Platform): CaptureBackendK
     return "screencapture-jpeg";
   }
   return "unavailable";
+}
+
+export function detectH264Encoder(platform: NodeJS.Platform): H264EncoderKind | null {
+  if (cachedH264Encoder !== undefined) return cachedH264Encoder;
+  const probe = NodeChildProcess.spawnSync("ffmpeg", ["-hide_banner", "-encoders"], {
+    encoding: "utf8",
+    timeout: 4000,
+  });
+  const output = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
+  const candidates: ReadonlyArray<H264EncoderKind> =
+    platform === "darwin"
+      ? ["h264_videotoolbox", "libx264"]
+      : platform === "win32"
+        ? ["h264_nvenc", "h264_mf", "libx264"]
+        : ["h264_nvenc", "libx264"];
+  for (const candidate of candidates) {
+    if (output.includes(candidate)) {
+      cachedH264Encoder = candidate;
+      return candidate;
+    }
+  }
+  cachedH264Encoder = null;
+  return null;
 }
 
 function execFileText(
@@ -176,6 +228,141 @@ async function discoverMacAvFoundationScreenIndices(): Promise<ReadonlyArray<num
   return indices;
 }
 
+function concatBytes(parts: ReadonlyArray<Uint8Array>): Uint8Array {
+  let total = 0;
+  for (const part of parts) total += part.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Parses an H.264 Annex-B elementary stream from ffmpeg stdout into self-contained
+ * WebCodecs-ready Access Units, caching SPS/PPS so every IDR keyframe carries full decoder config.
+ */
+export class H264AnnexBSplitter {
+  private buffer: Uint8Array = new Uint8Array(0);
+  private latestSps: Uint8Array | null = null;
+  private latestPps: Uint8Array | null = null;
+  private codecString = "avc1.4d4028";
+  private readonly onAccessUnit: (unit: {
+    readonly isKeyframe: boolean;
+    readonly codecString: string;
+    readonly bytes: Uint8Array;
+  }) => void;
+
+  constructor(
+    onAccessUnit: (unit: {
+      readonly isKeyframe: boolean;
+      readonly codecString: string;
+      readonly bytes: Uint8Array;
+    }) => void,
+  ) {
+    this.onAccessUnit = onAccessUnit;
+  }
+
+  private findStartCode(
+    data: Uint8Array,
+    from: number,
+  ): { readonly index: number; readonly length: number } | null {
+    for (let i = from; i <= data.byteLength - 3; i += 1) {
+      if (data[i] === 0x00 && data[i + 1] === 0x00) {
+        if (data[i + 2] === 0x01) {
+          return { index: i, length: 3 };
+        }
+        if (i + 3 < data.byteLength && data[i + 2] === 0x00 && data[i + 3] === 0x01) {
+          return { index: i, length: 4 };
+        }
+      }
+    }
+    return null;
+  }
+
+  private handleNalUnit(nal: Uint8Array): void {
+    if (nal.byteLength === 0) return;
+    const nalType = nal[0]! & 0x1f;
+
+    if (nalType === 7) {
+      this.latestSps = nal;
+      if (nal.byteLength >= 4) {
+        const p = nal[1]!.toString(16).padStart(2, "0");
+        const c = nal[2]!.toString(16).padStart(2, "0");
+        const l = nal[3]!.toString(16).padStart(2, "0");
+        this.codecString = `avc1.${p}${c}${l}`;
+      }
+      return;
+    }
+
+    if (nalType === 8) {
+      this.latestPps = nal;
+      return;
+    }
+
+    if (nalType === 5) {
+      if (!this.latestSps || !this.latestPps) return;
+      const bytes = concatBytes([
+        START_CODE_4,
+        this.latestSps,
+        START_CODE_4,
+        this.latestPps,
+        START_CODE_4,
+        nal,
+      ]);
+      this.onAccessUnit({
+        isKeyframe: true,
+        codecString: this.codecString,
+        bytes,
+      });
+      return;
+    }
+
+    if (nalType === 1) {
+      const bytes = concatBytes([START_CODE_4, nal]);
+      this.onAccessUnit({
+        isKeyframe: false,
+        codecString: this.codecString,
+        bytes,
+      });
+    }
+  }
+
+  push(chunk: Uint8Array): void {
+    const combined = this.buffer.byteLength === 0 ? chunk : concatBytes([this.buffer, chunk]);
+
+    let first = this.findStartCode(combined, 0);
+    if (!first) {
+      this.buffer = combined.byteLength > 3 ? combined.slice(combined.byteLength - 3) : combined;
+      return;
+    }
+
+    let cursor = first.index;
+    let scLen = first.length;
+    while (true) {
+      const next = this.findStartCode(combined, cursor + scLen);
+      if (!next) {
+        this.buffer = combined.slice(cursor);
+        return;
+      }
+      const nal = combined.slice(cursor + scLen, next.index);
+      this.handleNalUnit(nal);
+      cursor = next.index;
+      scLen = next.length;
+    }
+  }
+
+  flush(): void {
+    const first = this.findStartCode(this.buffer, 0);
+    if (first && first.index + first.length < this.buffer.byteLength) {
+      this.handleNalUnit(this.buffer.slice(first.index + first.length));
+    }
+    this.buffer = new Uint8Array(0);
+  }
+}
+
 /**
  * Extracts complete JPEG frames (SOI 0xFFD8 .. EOI 0xFFD9) from an ffmpeg image2pipe stdout stream.
  */
@@ -188,9 +375,7 @@ export class JpegStreamSplitter {
   }
 
   push(chunk: Uint8Array): void {
-    const combined = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
-    combined.set(this.buffer, 0);
-    combined.set(chunk, this.buffer.byteLength);
+    const combined = this.buffer.byteLength === 0 ? chunk : concatBytes([this.buffer, chunk]);
 
     let searchStart = 0;
     while (searchStart < combined.byteLength - 1) {
@@ -228,11 +413,160 @@ export class JpegStreamSplitter {
   }
 }
 
+async function buildFfmpegInputArgs(
+  platform: NodeJS.Platform,
+  display: RemoteDesktopDisplay,
+  fps: number,
+): Promise<Array<string>> {
+  if (platform === "darwin") {
+    const screenIndices = await discoverMacAvFoundationScreenIndices();
+    const targetScreen = screenIndices[display.index] ?? screenIndices[0] ?? 1;
+    return [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-fflags",
+      "nobuffer",
+      "-flags",
+      "low_delay",
+      "-f",
+      "avfoundation",
+      "-capture_cursor",
+      "1",
+      "-framerate",
+      String(fps),
+      "-i",
+      `${targetScreen}:none`,
+    ];
+  }
+  if (platform === "win32") {
+    return [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-fflags",
+      "nobuffer",
+      "-flags",
+      "low_delay",
+      "-f",
+      "gdigrab",
+      "-framerate",
+      String(fps),
+      "-draw_mouse",
+      "1",
+      "-i",
+      "desktop",
+    ];
+  }
+  const displayEnv = process.env.DISPLAY || ":0";
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-fflags",
+    "nobuffer",
+    "-flags",
+    "low_delay",
+    "-f",
+    "x11grab",
+    "-framerate",
+    String(fps),
+    "-i",
+    displayEnv,
+  ];
+}
+
+function buildH264EncoderArgs(
+  encoder: H264EncoderKind,
+  fps: number,
+  bitrateKbps: number,
+  maxBitrateKbps: number,
+): Array<string> {
+  const gop = String(Math.max(15, fps * 2));
+  const common = [
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    gop,
+    "-bf",
+    "0",
+    "-b:v",
+    `${bitrateKbps}k`,
+    "-maxrate",
+    `${maxBitrateKbps}k`,
+    "-bufsize",
+    `${bitrateKbps}k`,
+  ];
+
+  if (encoder === "h264_videotoolbox") {
+    return [
+      "-c:v",
+      "h264_videotoolbox",
+      "-realtime",
+      "1",
+      "-allow_sw",
+      "1",
+      "-profile:v",
+      "main",
+      ...common,
+      "-f",
+      "h264",
+      "-",
+    ];
+  }
+  if (encoder === "h264_nvenc") {
+    return [
+      "-c:v",
+      "h264_nvenc",
+      "-preset",
+      "p1",
+      "-tune",
+      "ull",
+      "-zerolatency",
+      "1",
+      "-profile:v",
+      "main",
+      ...common,
+      "-f",
+      "h264",
+      "-",
+    ];
+  }
+  if (encoder === "h264_mf") {
+    return [
+      "-c:v",
+      "h264_mf",
+      "-rate_control",
+      "cbr",
+      "-scenario",
+      "display_remoting",
+      ...common,
+      "-f",
+      "h264",
+      "-",
+    ];
+  }
+  return [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-tune",
+    "zerolatency",
+    "-profile:v",
+    "main",
+    ...common,
+    "-f",
+    "h264",
+    "-",
+  ];
+}
+
 export async function startScreenCapture(
   platform: NodeJS.Platform,
   options: CaptureOptions,
   callbacks: {
-    readonly onFrame: (jpegBytes: Uint8Array) => void;
+    readonly onFrame: (frame: CapturedFrame) => void;
     readonly onError: (message: string) => void;
   },
 ): Promise<CaptureSessionHandle> {
@@ -241,100 +575,84 @@ export async function startScreenCapture(
   const backend = detectCaptureBackend(platform);
 
   if (backend === "ffmpeg-h264") {
-    let args: Array<string>;
-    if (platform === "darwin") {
-      const screenIndices = await discoverMacAvFoundationScreenIndices();
-      const targetScreen = screenIndices[options.display.index] ?? screenIndices[0] ?? 1;
-      args = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "avfoundation",
-        "-capture_cursor",
-        "1",
-        "-framerate",
-        String(fps),
-        "-i",
-        `${targetScreen}:none`,
-        "-vf",
-        `scale='min(${profile.maxWidth},iw)':-2`,
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        String(profile.qscale),
-        "-f",
-        "image2pipe",
-        "-",
-      ];
-    } else if (platform === "win32") {
-      args = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "gdigrab",
-        "-framerate",
-        String(fps),
-        "-draw_mouse",
-        "1",
-        "-i",
-        "desktop",
-        "-vf",
-        `scale='min(${profile.maxWidth},iw)':-2`,
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        String(profile.qscale),
-        "-f",
-        "image2pipe",
-        "-",
-      ];
-    } else {
-      const displayEnv = process.env.DISPLAY || ":0";
-      args = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "x11grab",
-        "-framerate",
-        String(fps),
-        "-i",
-        displayEnv,
-        "-vf",
-        `scale='min(${profile.maxWidth},iw)':-2`,
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        String(profile.qscale),
-        "-f",
-        "image2pipe",
-        "-",
-      ];
-    }
+    const encoder = options.preferredCodec === "h264" ? detectH264Encoder(platform) : null;
+    const useH264 = encoder !== null;
+    const inputArgs = await buildFfmpegInputArgs(platform, options.display, fps);
+    // H.264 yuv420p requires even width and height.
+    const scaleFilter = `scale='trunc(min(${profile.maxWidth},iw)/2)*2':'trunc(ih*min(${profile.maxWidth},iw)/iw/2)*2'`;
+    const outputArgs = useH264
+      ? [
+          "-vf",
+          scaleFilter,
+          ...buildH264EncoderArgs(encoder, fps, profile.bitrateKbps, profile.maxBitrateKbps),
+        ]
+      : [
+          "-vf",
+          `scale='min(${profile.maxWidth},iw)':-2`,
+          "-c:v",
+          "mjpeg",
+          "-q:v",
+          String(profile.qscale),
+          "-f",
+          "image2pipe",
+          "-",
+        ];
 
+    const args = [...inputArgs, ...outputArgs];
     let stopped = false;
     let receivedFrame = false;
     let fallbackHandle: CaptureSessionHandle | null = null;
     const child = NodeChildProcess.spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const splitter = new JpegStreamSplitter((frame) => {
-      receivedFrame = true;
-      if (!stopped) callbacks.onFrame(frame);
-    });
+
+    const h264Splitter = useH264
+      ? new H264AnnexBSplitter((unit) => {
+          receivedFrame = true;
+          if (!stopped) {
+            callbacks.onFrame({
+              codec: "h264",
+              isKeyframe: unit.isKeyframe,
+              codecString: unit.codecString,
+              bytes: unit.bytes,
+            });
+          }
+        })
+      : null;
+
+    const jpegSplitter = !useH264
+      ? new JpegStreamSplitter((bytes) => {
+          receivedFrame = true;
+          if (!stopped) {
+            callbacks.onFrame({ codec: "jpeg", isKeyframe: true, bytes });
+          }
+        })
+      : null;
+
     let stderrTail = "";
     child.stdout.on("data", (chunk: Buffer) => {
-      if (!stopped) splitter.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+      if (stopped) return;
+      const bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      if (h264Splitter) h264Splitter.push(bytes);
+      else jpegSplitter?.push(bytes);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderrTail = `${stderrTail}${chunk.toString("utf8")}`.slice(-500);
     });
     child.on("exit", (code) => {
       if (stopped) return;
+      // If hardware H.264 failed before producing a single frame, seamlessly fall back to MJPEG.
+      if (!receivedFrame && useH264) {
+        void startScreenCapture(platform, { ...options, preferredCodec: "jpeg" }, callbacks).then(
+          (handle) => {
+            if (stopped) handle.stop();
+            else fallbackHandle = handle;
+          },
+        );
+        return;
+      }
       if (!receivedFrame && platform === "darwin" && NodeFS.existsSync(MAC_SCREENCAPTURE_PATH)) {
-        fallbackHandle = startMacScreenCaptureFallback(options, fps, callbacks);
+        fallbackHandle = startMacScreenCaptureFallback(options, Math.min(fps, 12), callbacks);
         return;
       }
       if (code !== 0) {
@@ -350,6 +668,7 @@ export async function startScreenCapture(
 
     return {
       backend: "ffmpeg-h264",
+      codec: useH264 ? "h264" : "jpeg",
       stop: () => {
         stopped = true;
         fallbackHandle?.stop();
@@ -369,6 +688,7 @@ export async function startScreenCapture(
   );
   return {
     backend: "unavailable",
+    codec: "jpeg",
     stop: () => {},
   };
 }
@@ -377,7 +697,7 @@ function startMacScreenCaptureFallback(
   options: CaptureOptions,
   fps: number,
   callbacks: {
-    readonly onFrame: (jpegBytes: Uint8Array) => void;
+    readonly onFrame: (frame: CapturedFrame) => void;
     readonly onError: (message: string) => void;
   },
 ): CaptureSessionHandle {
@@ -403,7 +723,11 @@ function startMacScreenCaptureFallback(
         try {
           const bytes = await NodeFSP.readFile(tempPath);
           if (!isStopped() && bytes.byteLength > 4) {
-            callbacks.onFrame(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+            callbacks.onFrame({
+              codec: "jpeg",
+              isKeyframe: true,
+              bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+            });
           }
         } catch {
           // Ignore transient read race.
@@ -427,6 +751,7 @@ function startMacScreenCaptureFallback(
 
   return {
     backend: "screencapture-jpeg",
+    codec: "jpeg",
     stop: () => {
       stopped = true;
     },
