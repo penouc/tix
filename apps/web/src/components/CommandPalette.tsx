@@ -1803,6 +1803,25 @@ function OpenCommandPaletteDialog(props: {
 
   actionItems.push({
     kind: "action",
+    value: "action:remote-desktop",
+    searchTerms: [
+      "remote desktop",
+      "screen cast",
+      "screen share",
+      "relay",
+      "cloudflare",
+      "桌面投屏",
+      "远程桌面",
+    ],
+    title: gt("Open remote desktop"),
+    icon: <MonitorIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/settings/connections" });
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
     value: "action:usage",
     searchTerms: ["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"],
     title: gt("Open usage"),

@@ -1,4 +1,5 @@
 import { EasDeviceHostConfigs, SimlockDeviceHostConfigs, SshDeviceHostConfigs } from "./device.ts";
+import { RemoteDesktopSettings, RemoteDesktopSettingsPatch } from "./remoteDesktop.ts";
 import {
   AuthOrchestrationOperateScope,
   AuthAccessWriteScope,
@@ -1658,6 +1659,10 @@ export const ServerSettings = Schema.Struct({
 
   /** Sent by the Usage tab with each summary request to this environment; edit in settings.json. Invalid values are ignored. */
   usageModelFilter: ForwardCompatibleOptional(UsageModelFilter),
+  /** E2EE remote desktop screen casting & optional Cloudflare relay configuration. */
+  remoteDesktop: RemoteDesktopSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed(Schema.decodeSync(RemoteDesktopSettings)({}))),
+  ),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -2049,6 +2054,7 @@ export const ServerSettingsPatch = Schema.Struct({
   usageModelAliases: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
   ),
+  remoteDesktop: Schema.optionalKey(RemoteDesktopSettingsPatch),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
@@ -2076,7 +2082,11 @@ export function requiredScopesForServerSettingsPatch(
   let changesAccess = false;
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
-    if (key === "requireConnectDeviceApproval" || key === "enablePreviewTunnel") {
+    if (
+      key === "requireConnectDeviceApproval" ||
+      key === "enablePreviewTunnel" ||
+      key === "remoteDesktop"
+    ) {
       changesAccess = true;
     } else if (
       key === "providers" ||

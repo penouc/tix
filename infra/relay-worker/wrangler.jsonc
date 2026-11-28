@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "tix-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+  // Replace or remove `routes` if deploying to your own custom domain or *.workers.dev.
+  "routes": [
+    {
+      "pattern": "relay.penglei.dev",
+      "custom_domain": true,
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RELAY_ROOM",
+        "class_name": "RelayRoom",
+      },
+    ],
+  },
+  // SQLite-backed Durable Objects work on both Cloudflare Workers Free and Paid plans.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RelayRoom"],
+    },
+  ],
+  "vars": {
+    "MAX_VIEWERS_PER_ROOM": "4",
+    "MAX_FRAME_BYTES": "4194304",
+  },
+}

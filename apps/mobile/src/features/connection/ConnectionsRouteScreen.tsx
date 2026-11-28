@@ -13,6 +13,7 @@ import { LocalEnvironmentList } from "./LocalEnvironmentList";
 import { PullRequestRoutingSettings } from "./PullRequestRoutingSettings";
 import { LinkedEnvironmentsSection } from "./LinkedEnvironmentsSection";
 import { LinkSeveralEnvironmentsAction } from "./LinkSeveralEnvironments";
+import { RemoteDesktopEnvironmentsSection } from "../remote-desktop/RemoteDesktopEnvironmentsSection";
 
 export function ConnectionsRouteScreen() {
   const gt = useGT();
@@ -77,6 +78,7 @@ export function ConnectionsRouteScreen() {
               />
             </Fragment>
           ))}
+        <RemoteDesktopEnvironmentsSection environments={connectedEnvironments} />
         <PullRequestRoutingSettings />
       </ScrollView>
     </View>

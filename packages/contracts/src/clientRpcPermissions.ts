@@ -105,6 +105,11 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.peerLinksPairLink]: AuthAccessWriteScope,
   // Send stores and sends a report from a thread's turn: the bar of running that thread.
   [WS_METHODS.agentFeedbackAnswerRequest]: AuthOrchestrationOperateScope,
+  // Issuing a remote desktop E2EE ticket or managing viewers/keys requires access/operate authority.
+  [WS_METHODS.remoteDesktopIssueTicket]: AuthOrchestrationOperateScope,
+  [WS_METHODS.remoteDesktopRotateKey]: AuthAccessWriteScope,
+  [WS_METHODS.remoteDesktopDisconnectViewer]: AuthAccessWriteScope,
+  [WS_METHODS.remoteDesktopProbeRelay]: AuthSettingsWriteScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

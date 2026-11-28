@@ -57,6 +57,7 @@ import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { usePeerLinkHosts } from "~/state/peerLinks";
 import { LoadBalancingSettings } from "./LoadBalancingSettings";
 import { PullRequestRoutingSettings } from "./PullRequestRoutingSettings";
+import { RemoteDesktopSettingsSection } from "../remote-desktop/RemoteDesktopSettingsSection";
 import { Input } from "../ui/input";
 import {
   Dialog,
@@ -1944,6 +1945,7 @@ function ConnectionsSettingsContent({
             />
           ))
         : null}
+      <RemoteDesktopSettingsSection />
       <LoadBalancingSettings environments={loadBalancingEnvironments} />
       <PullRequestRoutingSettings environments={loadBalancingEnvironments} />
     </SettingsPageContainer>

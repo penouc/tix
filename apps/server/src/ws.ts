@@ -213,6 +213,7 @@ import { terminalOutputStream, withOutputWindow } from "./terminal/OutputProtoco
 import { withSocketHeartbeat } from "./socketHeartbeat.ts";
 import * as ServerBrowser from "./preview/ServerBrowser.ts";
 import * as DeviceService from "./device/DeviceService.ts";
+import * as RemoteDesktopService from "./remoteDesktop/RemoteDesktopService.ts";
 import { remoteSshDeviceHosts } from "./device/localSshDeviceHost.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
@@ -1525,6 +1526,7 @@ export const layerWsRpc = (
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       const deviceService = yield* DeviceService.DeviceService;
+      const remoteDesktopService = yield* RemoteDesktopService.RemoteDesktopService;
       const deviceHostContext =
         yield* Effect.context<Effect.Services<ReturnType<typeof remoteSshDeviceHosts>>>();
       const orchestrationEngine = yield* Orchestrator.OrchestratorV2;
@@ -3523,6 +3525,13 @@ export const layerWsRpc = (
         [WS_METHODS.deviceDetail]: (input) => deviceService.detail(input),
         [WS_METHODS.deviceAction]: (input) => deviceService.action(input),
         [WS_METHODS.subscribeDeviceState]: (_input) => DeviceService.stateStream(deviceService),
+        [WS_METHODS.remoteDesktopGetStatus]: (_input) => remoteDesktopService.getStatus(),
+        [WS_METHODS.remoteDesktopIssueTicket]: (_input) => remoteDesktopService.issueTicket(),
+        [WS_METHODS.remoteDesktopRotateKey]: (_input) => remoteDesktopService.rotateKey(),
+        [WS_METHODS.remoteDesktopDisconnectViewer]: (input) =>
+          remoteDesktopService.disconnectViewer(input.peerId),
+        [WS_METHODS.remoteDesktopProbeRelay]: (input) => remoteDesktopService.probeRelay(input),
+        [WS_METHODS.remoteDesktopSubscribeStatus]: (_input) => remoteDesktopService.statusStream,
         [WS_METHODS.previewStopLocalServer]: (input) => portDiscovery.stopServer(input),
         [WS_METHODS.subscribeDiscoveredLocalServers]: (input) =>
           Stream.callback<DiscoveredLocalServerList>((queue) =>

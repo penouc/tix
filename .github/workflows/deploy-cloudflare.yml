@@ -1,8 +1,8 @@
-name: Deploy Cloudflare (CDN + Website)
+name: Deploy Cloudflare (CDN + Website + Relay)
 
-# Deploys the release CDN worker (cdn.penglei.dev) and marketing website
-# (tix.penglei.dev) to Cloudflare Workers using CLOUDFLARE_API_TOKEN and
-# CLOUDFLARE_ACCOUNT_ID repository secrets.
+# Deploys the release CDN worker (cdn.penglei.dev), remote desktop relay worker
+# (relay.penglei.dev), and marketing website (tix.penglei.dev) to Cloudflare Workers
+# using CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets.
 on:
   push:
     branches:
@@ -12,6 +12,7 @@ on:
       - "scripts/install.sh"
       - "scripts/install.ps1"
       - "infra/cdn-worker/**"
+      - "infra/relay-worker/**"
   release:
     types:
       - published
@@ -20,12 +21,14 @@ on:
       target:
         description: "What to deploy"
         required: false
-        default: both
+        default: all
         type: choice
         options:
+          - all
           - both
           - cdn
           - site
+          - relay
 
 permissions:
   contents: read
@@ -42,6 +45,7 @@ jobs:
     outputs:
       cdn: ${{ steps.targets.outputs.cdn }}
       site: ${{ steps.targets.outputs.site }}
+      relay: ${{ steps.targets.outputs.relay }}
     steps:
       - name: Determine targets
         id: targets
@@ -55,12 +59,16 @@ jobs:
         run: |
           cdn=false
           site=false
+          relay=false
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ "$INPUT_TARGET" = "both" ] || [ "$INPUT_TARGET" = "cdn" ] || [ -z "$INPUT_TARGET" ]; then
+            if [ "$INPUT_TARGET" = "all" ] || [ "$INPUT_TARGET" = "both" ] || [ "$INPUT_TARGET" = "cdn" ] || [ -z "$INPUT_TARGET" ]; then
               cdn=true
             fi
-            if [ "$INPUT_TARGET" = "both" ] || [ "$INPUT_TARGET" = "site" ] || [ -z "$INPUT_TARGET" ]; then
+            if [ "$INPUT_TARGET" = "all" ] || [ "$INPUT_TARGET" = "both" ] || [ "$INPUT_TARGET" = "site" ] || [ -z "$INPUT_TARGET" ]; then
               site=true
+            fi
+            if [ "$INPUT_TARGET" = "all" ] || [ "$INPUT_TARGET" = "relay" ] || [ -z "$INPUT_TARGET" ]; then
+              relay=true
             fi
           elif [ "$EVENT_NAME" = "release" ]; then
             site=true
@@ -71,6 +79,9 @@ jobs:
                   infra/cdn-worker/*)
                     cdn=true
                     ;;
+                  infra/relay-worker/*)
+                    relay=true
+                    ;;
                   apps/marketing/*|scripts/install.sh|scripts/install.ps1)
                     site=true
                     ;;
@@ -79,10 +90,12 @@ jobs:
             else
               cdn=true
               site=true
+              relay=true
             fi
           fi
           echo "cdn=$cdn" >> "$GITHUB_OUTPUT"
           echo "site=$site" >> "$GITHUB_OUTPUT"
+          echo "relay=$relay" >> "$GITHUB_OUTPUT"
 
   deploy-cdn:
     name: Deploy CDN (cdn.penglei.dev)
@@ -128,6 +141,28 @@ jobs:
 
       - name: Deploy tix-site to Cloudflare Workers Assets
         working-directory: apps/marketing
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4 deploy
+
+  deploy-relay:
+    name: Deploy Relay (relay.penglei.dev)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.relay == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: package.json
+
+      - name: Deploy tix-relay Worker
+        working-directory: infra/relay-worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

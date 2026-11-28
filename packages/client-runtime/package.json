@@ -670,6 +670,14 @@
     "./pull-request-references": {
       "types": "./src/pullRequestReferences.ts",
       "default": "./src/pullRequestReferences.ts"
+    },
+    "./remote-desktop/client": {
+      "types": "./src/remote-desktop/client.ts",
+      "default": "./src/remote-desktop/client.ts"
+    },
+    "./state/remote-desktop": {
+      "types": "./src/state/remoteDesktop.ts",
+      "default": "./src/state/remoteDesktop.ts"
     }
   },
   "scripts": {

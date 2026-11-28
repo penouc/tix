@@ -6,6 +6,7 @@ import {
   EasDeviceHostConfig,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
+  RemoteDesktopSettings,
   type ServerSettings,
   type SettingsSecretValue,
   SimlockDeviceHostConfig,
@@ -54,6 +55,7 @@ const textGeneratorSecretFields = secretSettingsFields(TextGeneratorConfig);
 const voiceSecretFields = secretSettingsFields(CloudSpeechCredentials);
 const easDeviceHostSecretFields = secretSettingsFields(EasDeviceHostConfig);
 const simlockDeviceHostSecretFields = secretSettingsFields(SimlockDeviceHostConfig);
+const remoteDesktopSecretFields = secretSettingsFields(RemoteDesktopSettings);
 const encode = (value: string) => Buffer.from(value, "utf8").toString("base64url");
 
 export interface SettingsSecret {
@@ -263,6 +265,11 @@ function mapSecretFieldGroups(
     textGenerators,
     easDeviceHosts,
     simlockDeviceHosts,
+    remoteDesktop: mapFields(
+      settings.remoteDesktop,
+      remoteDesktopSecretFields,
+      (field) => `remote-desktop-${field}`,
+    ) as ServerSettings["remoteDesktop"],
   };
 }
 

@@ -5,6 +5,14 @@ import {
   OrchestrationV2SearchThreadsInput,
   OrchestrationV2SearchThreadsResult,
 } from "./orchestrationV2.ts";
+import {
+  RemoteDesktopConnectTicket,
+  RemoteDesktopDisconnectViewerInput,
+  RemoteDesktopError,
+  RemoteDesktopProbeRelayInput,
+  RemoteDesktopProbeRelayResult,
+  RemoteDesktopStatus,
+} from "./remoteDesktop.ts";
 import { OrchestrationDispatchCommandError } from "./orchestrationDispatch.ts";
 import {
   McpAppCallToolInput,
@@ -588,6 +596,13 @@ export const WS_METHODS = {
   deviceShutdown: "device.shutdown",
   deviceDetail: "device.detail",
   deviceAction: "device.action",
+
+  remoteDesktopGetStatus: "remoteDesktop.getStatus",
+  remoteDesktopIssueTicket: "remoteDesktop.issueTicket",
+  remoteDesktopRotateKey: "remoteDesktop.rotateKey",
+  remoteDesktopDisconnectViewer: "remoteDesktop.disconnectViewer",
+  remoteDesktopProbeRelay: "remoteDesktop.probeRelay",
+  remoteDesktopSubscribeStatus: "remoteDesktop.subscribeStatus",
 
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
@@ -2130,6 +2145,43 @@ const WsSubscribeDeviceStateRpc = Rpc.make(WS_METHODS.subscribeDeviceState, {
   stream: true,
 });
 
+const WsRemoteDesktopGetStatusRpc = Rpc.make(WS_METHODS.remoteDesktopGetStatus, {
+  payload: Schema.Struct({}),
+  success: RemoteDesktopStatus,
+  error: Schema.Union([RemoteDesktopError, EnvironmentAuthorizationError]),
+});
+
+const WsRemoteDesktopIssueTicketRpc = Rpc.make(WS_METHODS.remoteDesktopIssueTicket, {
+  payload: Schema.Struct({}),
+  success: RemoteDesktopConnectTicket,
+  error: Schema.Union([RemoteDesktopError, EnvironmentAuthorizationError]),
+});
+
+const WsRemoteDesktopRotateKeyRpc = Rpc.make(WS_METHODS.remoteDesktopRotateKey, {
+  payload: Schema.Struct({}),
+  success: RemoteDesktopStatus,
+  error: Schema.Union([RemoteDesktopError, EnvironmentAuthorizationError]),
+});
+
+const WsRemoteDesktopDisconnectViewerRpc = Rpc.make(WS_METHODS.remoteDesktopDisconnectViewer, {
+  payload: RemoteDesktopDisconnectViewerInput,
+  success: RemoteDesktopStatus,
+  error: Schema.Union([RemoteDesktopError, EnvironmentAuthorizationError]),
+});
+
+const WsRemoteDesktopProbeRelayRpc = Rpc.make(WS_METHODS.remoteDesktopProbeRelay, {
+  payload: RemoteDesktopProbeRelayInput,
+  success: RemoteDesktopProbeRelayResult,
+  error: Schema.Union([RemoteDesktopError, EnvironmentAuthorizationError]),
+});
+
+const WsRemoteDesktopSubscribeStatusRpc = Rpc.make(WS_METHODS.remoteDesktopSubscribeStatus, {
+  payload: Schema.Struct({}),
+  success: RemoteDesktopStatus,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 const WsOrchestrationV2DispatchCommandRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, {
   payload: OrchestrationV2RpcSchemas.dispatchCommand.input,
   success: OrchestrationV2RpcSchemas.dispatchCommand.output,
@@ -2731,6 +2783,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsDeviceDetailRpc,
   WsDeviceActionRpc,
   WsSubscribeDeviceStateRpc,
+  WsRemoteDesktopGetStatusRpc,
+  WsRemoteDesktopIssueTicketRpc,
+  WsRemoteDesktopRotateKeyRpc,
+  WsRemoteDesktopDisconnectViewerRpc,
+  WsRemoteDesktopProbeRelayRpc,
+  WsRemoteDesktopSubscribeStatusRpc,
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
